@@ -29,7 +29,7 @@ mcp = FastMCP(
     This toolset allows you to function as an autonomous user on Bluesky.
     
     Capabilities:
-    - **Read**: Fetch timelines, user profiles (`get_profile`), and search for posts (`search_posts`).
+    - **Read**: Fetch timelines, user profiles (`get_profile`), and search posts/users (`search`).
     - **Write**: Create new posts (`send_post`) and reply to others (`reply_to_post`).
     - **React**: Like (`like_post`) and Repost (`repost`) content.
     - **Monitor**: Check notifications (`get_notifications`).
@@ -579,22 +579,31 @@ def get_notifications(
     unread_only: bool = True,
 ) -> str:
     """
-    获取通知列表（被提及、回复、点赞、转发、关注等）。
+    获取通知列表（被提及、回复、点赞、转发、关注等），同时返回未读通知总数。
 
     Args:
         limit: 获取通知数量，最大 100
         cursor: 分页游标
         filter_reason: 可选，筛选特定类型的通知 (like, repost, follow, mention, reply, quote)
-        unread_only: 只返回未读通知，默认 True。获取未读通知后会自动标记为已读。
+        unread_only: 只返回未读通知，默认 True。
+                     注意：只有当所有未读通知都被获取完毕（remaining_unread 为 0）时，
+                     系统才会自动将它们标记为已读。这允许你分页处理大量未读通知而不丢失状态。
 
     Returns:
-        通知列表
+        JSON 字符串，包含：
+        - notifications: 通知列表
+        - total_unread: 调用前的总未读数
+        - remaining_unread: 本次获取后剩余的未读数（如果 > 0，建议继续调用以获取剩余通知）
+        - cursor: 下一页的游标
     """
     client = get_client()
 
+    # 获取通知列表和未读计数
     notifs = client.app.bsky.notification.list_notifications(
         {"limit": min(limit, 100), "cursor": cursor}
     )
+    unread_data = client.app.bsky.notification.get_unread_count({})
+    total_unread = unread_data.count
 
     notifications = [format_notification(n) for n in notifs.notifications]
 
@@ -602,35 +611,28 @@ def get_notifications(
     if filter_reason:
         notifications = [n for n in notifications if n["reason"] == filter_reason]
 
-    # 只返回未读通知
+    # 计算本次返回后剩余的未读数（近似值）
+    # 注意：如果使用了 filter_reason，这个计算可能不完全准确，但对 AI 来说足够作为"是否继续"的参考
+    fetched_count = len(notifications)
+    remaining_unread = max(0, total_unread - fetched_count)
+
+    # 智能已读逻辑：
+    # 只有当 unread_only=True 且我们不仅获取了通知，还确信已经覆盖了所有未读消息时，才标记为已读。
+    # 这样可以防止分页读取时，第一页读完就把后面页的未读状态全清掉了。
     if unread_only:
         notifications = [n for n in notifications if not n["is_read"]]
-        # 获取未读通知后自动标记为已读
-        if notifications:
+        
+        # 只有当没有剩余未读（意味着我们这次把积压的全读了）时，才执行标记
+        if remaining_unread == 0 and notifications:
             now = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
             client.app.bsky.notification.update_seen({"seenAt": now})
 
     return json.dumps({
         "notifications": notifications,
-        "cursor": notifs.cursor if not unread_only else None,  # 未读模式下不返回 cursor，因为过滤后分页无意义
+        "cursor": notifs.cursor if remaining_unread > 0 else None,
         "count": len(notifications),
-    }, ensure_ascii=False, indent=2)
-
-
-@mcp.tool()
-def get_unread_count() -> str:
-    """
-    获取未读通知数量。
-
-    Returns:
-        未读通知数量
-    """
-    client = get_client()
-
-    unread = client.app.bsky.notification.get_unread_count({})
-
-    return json.dumps({
-        "unread_count": unread.count,
+        "total_unread": total_unread,
+        "remaining_unread": remaining_unread,
     }, ensure_ascii=False, indent=2)
 
 
@@ -664,32 +666,6 @@ def get_profile(handle: str) -> str:
         "follows_count": profile.follows_count or 0,
         "posts_count": profile.posts_count or 0,
         "indexed_at": profile.indexed_at or "",
-    }, ensure_ascii=False, indent=2)
-
-
-@mcp.tool()
-def get_my_profile() -> str:
-    """
-    获取当前登录用户（Nocturne）的资料。
-
-    Returns:
-        当前用户资料信息
-    """
-    client = get_client()
-    me = client.me
-
-    # 获取完整资料
-    profile = client.get_profile(actor=me.handle)
-
-    return json.dumps({
-        "did": me.did,
-        "handle": me.handle,
-        "display_name": profile.display_name or me.handle,
-        "description": profile.description or "",
-        "avatar": profile.avatar or "",
-        "followers_count": profile.followers_count or 0,
-        "follows_count": profile.follows_count or 0,
-        "posts_count": profile.posts_count or 0,
     }, ensure_ascii=False, indent=2)
 
 
@@ -745,16 +721,18 @@ def unfollow_user(handle: str) -> str:
 
 
 @mcp.tool()
-def search_posts(
+def search(
     query: str,
+    type: str = "posts",
     limit: int = 25,
     cursor: Optional[str] = None,
 ) -> str:
     """
-    搜索帖子。
+    搜索帖子或用户。
 
     Args:
         query: 搜索关键词
+        type: 搜索类型，"posts" 或 "users"，默认 "posts"
         limit: 返回数量，最大 100
         cursor: 分页游标
 
@@ -763,66 +741,48 @@ def search_posts(
     """
     client = get_client()
 
-    # 使用 app.bsky.feed.searchPosts
-    results = client.app.bsky.feed.search_posts({
-        "q": query,
-        "limit": min(limit, 100),
-        "cursor": cursor,
-    })
+    if type == "users":
+        results = client.app.bsky.actor.search_actors({
+            "q": query,
+            "limit": min(limit, 100),
+            "cursor": cursor,
+        })
 
-    posts = [format_post({"post": p}) for p in results.posts]
+        users = [
+            {
+                "did": u.did,
+                "handle": u.handle,
+                "display_name": u.display_name or u.handle,
+                "description": (u.description or "")[:200],
+                "avatar": u.avatar or "",
+            }
+            for u in results.actors
+        ]
 
-    return json.dumps({
-        "query": query,
-        "posts": posts,
-        "cursor": results.cursor if hasattr(results, "cursor") else None,
-        "count": len(posts),
-    }, ensure_ascii=False, indent=2)
+        return json.dumps({
+            "query": query,
+            "type": "users",
+            "users": users,
+            "cursor": results.cursor if hasattr(results, "cursor") else None,
+            "count": len(users),
+        }, ensure_ascii=False, indent=2)
 
+    else:  # posts
+        results = client.app.bsky.feed.search_posts({
+            "q": query,
+            "limit": min(limit, 100),
+            "cursor": cursor,
+        })
 
-@mcp.tool()
-def search_users(
-    query: str,
-    limit: int = 25,
-    cursor: Optional[str] = None,
-) -> str:
-    """
-    搜索用户。
+        posts = [format_post({"post": p}) for p in results.posts]
 
-    Args:
-        query: 搜索关键词
-        limit: 返回数量，最大 100
-        cursor: 分页游标
-
-    Returns:
-        搜索结果
-    """
-    client = get_client()
-
-    # 使用 app.bsky.actor.searchActors
-    results = client.app.bsky.actor.search_actors({
-        "q": query,
-        "limit": min(limit, 100),
-        "cursor": cursor,
-    })
-
-    users = [
-        {
-            "did": u.did,
-            "handle": u.handle,
-            "display_name": u.display_name or u.handle,
-            "description": (u.description or "")[:200],
-            "avatar": u.avatar or "",
-        }
-        for u in results.actors
-    ]
-
-    return json.dumps({
-        "query": query,
-        "users": users,
-        "cursor": results.cursor if hasattr(results, "cursor") else None,
-        "count": len(users),
-    }, ensure_ascii=False, indent=2)
+        return json.dumps({
+            "query": query,
+            "type": "posts",
+            "posts": posts,
+            "cursor": results.cursor if hasattr(results, "cursor") else None,
+            "count": len(posts),
+        }, ensure_ascii=False, indent=2)
 
 
 # ============================================================================
@@ -834,7 +794,8 @@ def get_current_profile_resource() -> str:
     """
     当前登录用户的资料（作为 MCP 资源）。
     """
-    return get_my_profile()
+    client = get_client()
+    return get_profile(client.me.handle)
 
 
 @mcp.resource("bluesky://notifications/unread")
@@ -842,7 +803,9 @@ def get_unread_count_resource() -> str:
     """
     未读通知数量（作为 MCP 资源）。
     """
-    return get_unread_count()
+    client = get_client()
+    unread = client.app.bsky.notification.get_unread_count({})
+    return json.dumps({"unread_count": unread.count}, ensure_ascii=False)
 
 
 # ============================================================================

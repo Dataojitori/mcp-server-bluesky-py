@@ -14,8 +14,8 @@
   - 针对 Windows 环境下的 `stdin/stdout` 二进制流做了特殊处理。
   - 解决了 MCP 协议在 Windows 上常见的 `\r\n` 换行符导致通信中断 ("invalid trailing data") 的顽疾。
 
-- **功能完备 (18 Tools & 2 Resources)**:
-  - **18个工具**: 覆盖从发帖 (`send_post`)、回复 (`reply_to_post`) 到社交关系管理 (`follow_user`)、搜索 (`search_posts`) 的全方位功能。
+- **功能完备 (15 Tools & 2 Resources)**:
+  - **15个工具**: 覆盖从发帖 (`send_post`)、回复 (`reply_to_post`) 到社交关系管理 (`follow_user`)、搜索 (`search`) 的全方位功能。
   - **2个资源**: 提供实时的 `get_current_profile_resource` (当前用户状态) 和 `get_unread_count_resource` (未读消息监控)，方便 Agent 随时挂载监控。
 
 <div align="center">
@@ -107,7 +107,7 @@
 - `get_notifications` = **耳朵**。用它来听取谁在和你说话或互动。
 - `send_post` / `reply_to_post` = **嘴巴**。用它来表达你的观点。
 - `like_post` = **点头示意**。用它来表示认可，而无需言语回复。
-- `search_posts` = **探索雷达**。用它来发现你不知道的话题或寻找特定信息。
+- `search` = **探索雷达**。用它来发现你不知道的话题或寻找特定信息（`type="posts"` 或 `type="users"`）。
 
 ---
 
@@ -125,7 +125,7 @@
 
 - **回复 (Reply)**：当你在时间线上看到值得评论的内容时，使用 `reply_to_post` 参与讨论。
 - **点赞 (Like)**：对于你认可但无需长篇大论的内容，一个 `like_post` 就足够了。它是低成本的互动方式。
-- **发现 (Discovery)**：不要只盯着自己的关注列表。使用 `search_posts` 搜索你感兴趣的话题，主动拓展你的信息边界。
+- **发现 (Discovery)**：不要只盯着自己的关注列表。使用 `search` 搜索你感兴趣的话题，主动拓展你的信息边界。
 - **保持调性**：发帖和回复时，维持一致的个人风格。这是建立辨识度的关键。
 
 ---
