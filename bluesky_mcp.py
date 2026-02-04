@@ -9,7 +9,10 @@ if sys.platform == 'win32':
     msvcrt.setmode(sys.stdout.fileno(), os.O_BINARY)
 
 import json
+import hashlib
+import httpx
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Optional, Any
 from functools import lru_cache
 
@@ -580,6 +583,7 @@ def get_notifications(
 ) -> str:
     """
     获取通知列表（被提及、回复、点赞、转发、关注等），同时返回未读通知总数。
+	注意：消息中的图片链接不会在此显示，需要手动get_post_thread才能得到。
 
     Args:
         limit: 获取通知数量，最大 100
@@ -731,7 +735,7 @@ def search(
     搜索帖子或用户。
 
     Args:
-        query: 搜索关键词
+        query: 搜索关键词(and 逻辑，输入的关键词越多，得到的结果越少)
         type: 搜索类型，"posts" 或 "users"，默认 "posts"
         limit: 返回数量，最大 100
         cursor: 分页游标
@@ -806,6 +810,73 @@ def get_unread_count_resource() -> str:
     client = get_client()
     unread = client.app.bsky.notification.get_unread_count({})
     return json.dumps({"unread_count": unread.count}, ensure_ascii=False)
+
+
+# ============================================================================
+# 图片下载工具
+# ============================================================================
+
+# 项目根目录
+_PROJECT_ROOT = Path(__file__).parent
+_DOWNLOAD_DIR = _PROJECT_ROOT / "downloaded_images"
+
+
+@mcp.tool()
+def download_image(url: str) -> str:
+    """
+    下载图片到本地。你在后续可使用read工具自己查看图片。
+    
+    Args:
+        url: 图片URL
+    
+    Returns:
+        下载后的本地绝对路径
+    """
+    # 按日期创建子目录
+    today = datetime.now().strftime("%Y-%m-%d")
+    save_dir = _DOWNLOAD_DIR / today
+    save_dir.mkdir(parents=True, exist_ok=True)
+    
+    # 从 URL 推断扩展名
+    if "@" in url:
+        ext = url.split("@")[-1].lower()
+    else:
+        ext = url.split(".")[-1].lower()
+        
+    if ext not in ("jpeg", "jpg", "png", "gif", "webp"):
+        ext = "jpg"
+    
+    # 使用 URL 的 hash 作为文件名
+    safe_filename = hashlib.md5(url.encode()).hexdigest()[:12]
+    file_path = save_dir / f"{safe_filename}.{ext}"
+    
+    # 如果已存在则跳过下载
+    if file_path.exists():
+        return json.dumps({
+            "success": True,
+            "local_path": str(file_path.resolve()),
+            "already_existed": True
+        }, ensure_ascii=False, indent=2)
+    
+    # 下载图片
+    try:
+        with httpx.Client(timeout=30.0) as client:
+            response = client.get(url, follow_redirects=True)
+            response.raise_for_status()
+            
+            file_path.write_bytes(response.content)
+            
+            return json.dumps({
+                "success": True,
+                "local_path": str(file_path.resolve())
+            }, ensure_ascii=False, indent=2)
+    
+    except Exception as e:
+        return json.dumps({
+            "success": False,
+            "error": str(e),
+            "url": url
+        }, ensure_ascii=False, indent=2)
 
 
 # ============================================================================
