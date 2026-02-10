@@ -575,68 +575,82 @@ def unrepost(post_uri: str) -> str:
 # ============================================================================
 
 @mcp.tool()
-def get_notifications(
-    limit: int = 25,
-    cursor: Optional[str] = None,
-    filter_reason: Optional[str] = None,
-    unread_only: bool = True,
-) -> str:
+def get_notifications() -> str:
     """
-    获取通知列表（被提及、回复、点赞、转发、关注等），同时返回未读通知总数。
-	注意：消息中的图片链接不会在此显示，需要手动get_post_thread才能得到。
-
-    Args:
-        limit: 获取通知数量，最大 100
-        cursor: 分页游标
-        filter_reason: 可选，筛选特定类型的通知 (like, repost, follow, mention, reply, quote)
-        unread_only: 只返回未读通知，默认 True。
-                     注意：只有当所有未读通知都被获取完毕（remaining_unread 为 0）时，
-                     系统才会自动将它们标记为已读。这允许你分页处理大量未读通知而不丢失状态。
+    获取通知列表。
+    
+    自动处理逻辑：
+    1. 检查未读数量。
+    2. 如果有未读：自动循环获取所有未读通知（有安全上限），展示它们，并将所有未读标记为已读。
+    3. 如果无未读：获取最近 10 条历史通知以供参考。
 
     Returns:
-        JSON 字符串，包含：
-        - notifications: 通知列表
-        - total_unread: 调用前的总未读数
-        - remaining_unread: 本次获取后剩余的未读数（如果 > 0，建议继续调用以获取剩余通知）
-        - cursor: 下一页的游标
+        JSON 字符串，包含通知列表和状态信息。
     """
     client = get_client()
 
-    # 获取通知列表和未读计数
-    notifs = client.app.bsky.notification.list_notifications(
-        {"limit": min(limit, 100), "cursor": cursor}
-    )
+    # 1. 获取未读计数
     unread_data = client.app.bsky.notification.get_unread_count({})
     total_unread = unread_data.count
-
-    notifications = [format_notification(n) for n in notifs.notifications]
-
-    # 如果指定了筛选条件
-    if filter_reason:
-        notifications = [n for n in notifications if n["reason"] == filter_reason]
-
-    # 计算本次返回后剩余的未读数（近似值）
-    # 注意：如果使用了 filter_reason，这个计算可能不完全准确，但对 AI 来说足够作为"是否继续"的参考
-    fetched_count = len(notifications)
-    remaining_unread = max(0, total_unread - fetched_count)
-
-    # 智能已读逻辑：
-    # 只有当 unread_only=True 且我们不仅获取了通知，还确信已经覆盖了所有未读消息时，才标记为已读。
-    # 这样可以防止分页读取时，第一页读完就把后面页的未读状态全清掉了。
-    if unread_only:
-        notifications = [n for n in notifications if not n["is_read"]]
+    
+    notifications = []
+    status_msg = ""
+    
+    if total_unread > 0:
+        # 有未读消息：循环获取直到拿到所有未读
+        # 设置一个安全上限 (例如 200) 防止上下文溢出
+        SAFETY_LIMIT = 200
+        cursor = None
         
-        # 只有当没有剩余未读（意味着我们这次把积压的全读了）时，才执行标记
-        if remaining_unread == 0 and notifications:
-            now = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
-            client.app.bsky.notification.update_seen({"seenAt": now})
+        # 循环拉取
+        while len(notifications) < total_unread and len(notifications) < SAFETY_LIMIT:
+            remaining = total_unread - len(notifications)
+            batch_limit = min(50, remaining)  # 不再 +10，精确拉取
+            
+            resp = client.app.bsky.notification.list_notifications(
+                {"limit": batch_limit, "cursor": cursor}
+            )
+            
+            if not resp.notifications:
+                break
+                
+            notifications.extend(resp.notifications)
+            cursor = resp.cursor
+            
+            if not cursor:
+                break
+        
+        # 只保留未读的（以防 API 返回了一些混杂的已读消息）
+        # 注意：atproto SDK 可能使用 is_read 或 isRead，用 getattr 安全访问
+        def is_unread(n):
+            return not (getattr(n, 'is_read', None) or getattr(n, 'isRead', False))
+        
+        unread_notifications = [n for n in notifications if is_unread(n)]
+        
+        # 如果过滤后列表为空（比如 API 计数延迟），退化为使用所有获取到的
+        target_list = unread_notifications if unread_notifications else notifications
+        
+        # 获取完毕后，再标记为已读
+        now = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+        client.app.bsky.notification.update_seen({"seenAt": now})
+        
+        status_msg = f"Fetched {len(target_list)} unread notifications and marked all as read."
+        notifications = target_list
+        
+    else:
+        # 无未读消息：获取最近 10 条作为上下文
+        resp = client.app.bsky.notification.list_notifications({"limit": 10})
+        notifications = resp.notifications
+        status_msg = "No new notifications. Showing recent history."
+
+    # 格式化
+    formatted_notifs = [format_notification(n) for n in notifications]
 
     return json.dumps({
-        "notifications": notifications,
-        "cursor": notifs.cursor if remaining_unread > 0 else None,
-        "count": len(notifications),
-        "total_unread": total_unread,
-        "remaining_unread": remaining_unread,
+        "notifications": formatted_notifs,
+        "count": len(formatted_notifs),
+        "total_unread_was": total_unread,
+        "status": status_msg
     }, ensure_ascii=False, indent=2)
 
 
