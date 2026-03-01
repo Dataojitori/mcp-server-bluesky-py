@@ -8,6 +8,7 @@ if sys.platform == 'win32':
     msvcrt.setmode(sys.stdin.fileno(), os.O_BINARY)
     msvcrt.setmode(sys.stdout.fileno(), os.O_BINARY)
 
+import re
 import json
 import hashlib
 import httpx
@@ -87,6 +88,58 @@ class BlueskyClient:
 def get_client() -> Client:
     """获取 Bluesky 客户端"""
     return BlueskyClient().get_client()
+
+
+MENTION_REGEX = re.compile(
+    r'(?<![a-zA-Z0-9])@(([a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?\.)+[a-zA-Z]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?)'
+)
+URL_REGEX = re.compile(r'https?://[^\s]+')
+
+
+def _build_rich_text(text: str, client: Client) -> client_utils.TextBuilder:
+    """Parse @mentions in text and return a TextBuilder with proper mention facets."""
+    builder = client_utils.TextBuilder()
+    last_end = 0
+    handle_to_did = {}
+    url_spans = [(match.start(), match.end()) for match in URL_REGEX.finditer(text)]
+    current_url_index = 0
+
+    for match in MENTION_REGEX.finditer(text):
+        handle = match.group(1)
+        mention_start = match.start()
+
+        while current_url_index < len(url_spans) and mention_start >= url_spans[current_url_index][1]:
+            current_url_index += 1
+
+        if current_url_index < len(url_spans):
+            url_start, url_end = url_spans[current_url_index]
+            if url_start <= mention_start < url_end:
+                continue
+
+        if mention_start > last_end:
+            builder.text(text[last_end:mention_start])
+
+        if handle in handle_to_did:
+            did = handle_to_did[handle]
+            if did:
+                builder.mention(f"@{handle}", did)
+            else:
+                builder.text(f"@{handle}")
+        else:
+            try:
+                profile = client.get_profile(actor=handle)
+                handle_to_did[handle] = profile.did
+                builder.mention(f"@{handle}", profile.did)
+            except Exception:
+                handle_to_did[handle] = None
+                builder.text(f"@{handle}")
+
+        last_end = match.end()
+
+    if last_end < len(text):
+        builder.text(text[last_end:])
+
+    return builder
 
 
 def _get_attr(obj: Any, path: str, default: Any = None) -> Any:
@@ -243,17 +296,14 @@ def send_post(
     total_len = text_len + separator_len + link_display_len
 
     try:
+        text_builder = _build_rich_text(text, client)
+
         if link_url:
-            # 使用 TextBuilder 构建带链接的帖子
-            text_builder = client_utils.TextBuilder()
-            text_builder.text(text)
             if separator_len:
                 text_builder.text(" ")
             text_builder.link(link_display, link_url)
 
-            post = client.send_post(text_builder)
-        else:
-            post = client.send_post(text=text)
+        post = client.send_post(text_builder)
 
         return json.dumps({
             "success": True,
@@ -332,7 +382,8 @@ def reply_to_post(
                 "cid": parent.record.reply.root.cid,
             }
 
-        post = client.send_post(text=text, reply_to=reply_ref)
+        text_builder = _build_rich_text(text, client)
+        post = client.send_post(text_builder, reply_to=reply_ref)
 
         return json.dumps({
             "success": True,
