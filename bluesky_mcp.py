@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import Optional, Any
 from functools import lru_cache
 
+
 from mcp.server.fastmcp import FastMCP
 from atproto import Client, client_utils
 from pydantic import BaseModel, Field
@@ -215,7 +216,7 @@ def send_post(
     link_description: Optional[str] = None,
 ) -> str:
     """
-    发送一条 Bluesky 帖子。
+    发送一条新的 Bluesky 帖子。**回复特定帖子请用 reply_to_post 工具别搞错了**。
 
     CRITICAL LIMITATION: Bluesky posts are strictly limited to 300 characters (300 graphemes).
     If your text exceeds this, the API will return a 400 InvalidRequest error.
@@ -234,16 +235,21 @@ def send_post(
     client = get_client()
 
     # 估算长度 (近似值，Bluesky 使用 grapheme 计数，Python len() 是 code points)
-    input_length = len(text)
+    # 我们不在本地拦截，因为可能存在计算差异，让 API 决定是否超限
+    text_len = len(text)
+    link_display = link_title or link_url or ""
+    link_display_len = len(link_display) if link_url else 0
+    separator_len = (1 if link_url and not text.endswith(" ") and not text.endswith("\n") else 0)
+    total_len = text_len + separator_len + link_display_len
 
     try:
         if link_url:
             # 使用 TextBuilder 构建带链接的帖子
             text_builder = client_utils.TextBuilder()
             text_builder.text(text)
-            if not text.endswith(" ") and not text.endswith("\n"):
+            if separator_len:
                 text_builder.text(" ")
-            text_builder.link(link_title or link_url, link_url)
+            text_builder.link(link_display, link_url)
 
             post = client.send_post(text_builder)
         else:
@@ -253,17 +259,32 @@ def send_post(
             "success": True,
             "uri": post.uri,
             "cid": post.cid,
-            "message": f"Post sent successfully!"
+            "message": f"Post sent successfully! ({total_len}/300 chars used)"
         }, ensure_ascii=False, indent=2)
 
     except Exception as e:
+        # 如果 API 报错，大概率是长度问题，提供详细的长度分解帮助 AI 调试
+        breakdown = {
+            "text_body": f"{text_len} chars"
+        }
+        instruction = "If the error mentions length/graphemes, shorten the text body."
+        if link_url:
+            breakdown["link_display_text"] = f"{link_display_len} chars"
+            breakdown["separator"] = f"{separator_len} char"
+            instruction = ("If the error mentions length/graphemes, shorten the text body or provide a shorter link_title. "
+                           "Note: The link_title is the clickable display text. If no link_title is given, "
+                           "the full URL is displayed and counts toward the 300 character limit.")
+
+        breakdown["total_approx"] = f"{total_len} chars"
+        breakdown["limit"] = 300
+        breakdown["over_by_approx"] = f"{max(0, total_len - 300)} chars"
+
         return json.dumps({
             "success": False,
             "error": "Failed to send post",
             "details": str(e),
-            "input_length_approx": input_length,
-            "limit": 300,
-            "instruction": "Text is likely too long. Please shorten it to under 300 characters and try again."
+            "length_breakdown": breakdown,
+            "instruction": instruction
         }, ensure_ascii=False, indent=2)
 
 
@@ -285,7 +306,7 @@ def reply_to_post(
         回复帖子的 URI，或者包含长度信息的错误提示
     """
     client = get_client()
-    input_length = len(text)
+    text_len = len(text)
 
     try:
         # 获取原帖信息以构建回复引用
@@ -318,7 +339,7 @@ def reply_to_post(
             "uri": post.uri,
             "cid": post.cid,
             "replied_to": parent.author.handle,
-            "message": f"Replied successfully to @{parent.author.handle}!"
+            "message": f"Replied successfully to @{parent.author.handle}! ({text_len}/300 chars used)"
         }, ensure_ascii=False, indent=2)
 
     except Exception as e:
@@ -326,9 +347,13 @@ def reply_to_post(
             "success": False,
             "error": "Failed to reply to post",
             "details": str(e),
-            "input_length_approx": input_length,
-            "limit": 300,
-            "instruction": "Text is likely too long. Please shorten it to under 300 characters and try again."
+            "length_breakdown": {
+                "text_body": f"{text_len} chars",
+                "total_approx": f"{text_len} chars",
+                "limit": 300,
+                "over_by_approx": f"{max(0, text_len - 300)} chars",
+            },
+            "instruction": "If the error mentions length/graphemes, shorten the reply text to under 300 characters."
         }, ensure_ascii=False, indent=2)
 
 
