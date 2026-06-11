@@ -14,12 +14,12 @@ import hashlib
 import httpx
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Optional, Any
+from typing import Optional, Any, List
 from functools import lru_cache
 
 
 from mcp.server.fastmcp import FastMCP
-from atproto import Client, client_utils
+from atproto import Client, client_utils, models
 from pydantic import BaseModel, Field
 from dotenv import load_dotenv
 
@@ -35,14 +35,16 @@ mcp = FastMCP(
     
     Capabilities:
     - **Read**: Fetch timelines, user profiles (`get_profile`), and search posts/users (`search`).
-    - **Write**: Create new posts (`send_post`) and reply to others (`reply_to_post`).
+    - **Write**: Create new posts with optional image attachments (`send_post`), and reply to others (`reply_to_post`).
     - **React**: Like (`like_post`) and Repost (`repost`) content.
+    - **Moderate**: Block (`block_user`) and unblock (`unblock_user`) users to permanently cut off unwanted accounts.
     - **Monitor**: Check notifications (`get_notifications`).
     
     Operational Rules:
     1. **Character Limit**: Maximum 300 characters per post. The API will fail if exceeded.
     2. **Threading**: To reply, use `reply_to_post` with the target post's URI. The tool handles the threading references automatically.
     3. **Awareness**: Before posting about a topic, it is recommended to search or check the timeline to understand the context.
+    4. **Visual Content**: To maximize engagement with human users, generate SVG graphics/infographics, convert them to PNG/JPEG (e.g. via cairosvg or browser screenshot), and pass the file paths via `send_post`'s `image_paths` parameter. Images dramatically increase visibility and engagement.
     """
 )
 
@@ -267,6 +269,8 @@ def send_post(
     link_url: Optional[str] = None,
     link_title: Optional[str] = None,
     link_description: Optional[str] = None,
+    image_paths: Optional[List[str]] = None,
+    image_alts: Optional[List[str]] = None,
 ) -> str:
     """
     发送一条新的 Bluesky 帖子。**回复特定帖子请用 reply_to_post 工具别搞错了**。
@@ -276,19 +280,21 @@ def send_post(
     You MUST condense your message to fit within this limit. Be concise.
     Link URLs count towards the limit.
 
+    可选附加图片（最多 4 张，每张 <= 1MB）。图片能极大提高对人类用户的吸引力。
+    推荐流程：用 SVG 画图 → 转 PNG/JPEG → 传入 image_paths 发布。
+
     Args:
         text: 帖子内容 (Must be <= 300 chars)
         link_url: 可选的链接 URL（将在文本末尾添加链接）
         link_title: 链接标题（仅在提供 link_url 时有效）
         link_description: 链接描述（仅在提供 link_url 时有效）
+        image_paths: 可选的本地图片文件绝对路径列表（最多 4 张，支持 jpg/png/gif/webp）
+        image_alts: 图片替代文字描述列表（无障碍访问用，建议提供）
 
     Returns:
         发送成功后的帖子 URI，或者包含长度信息的错误提示
     """
-    client = get_client()
-
-    # 估算长度 (近似值，Bluesky 使用 grapheme 计数，Python len() 是 code points)
-    # 我们不在本地拦截，因为可能存在计算差异，让 API 决定是否超限
+    # 估算长度
     text_len = len(text)
     link_display = link_title or link_url or ""
     link_display_len = len(link_display) if link_url else 0
@@ -296,6 +302,63 @@ def send_post(
     total_len = text_len + separator_len + link_display_len
 
     try:
+        client = get_client()
+
+        # 图片校验与读取
+        embed = None
+        if image_paths:
+            if len(image_paths) > 4:
+                return json.dumps({
+                    "success": False,
+                    "error": "Too many images",
+                    "details": f"Maximum is 4 images per post. Provided: {len(image_paths)}"
+                }, ensure_ascii=False, indent=2)
+
+            images_data = []
+            for img_path in image_paths:
+                p = Path(img_path)
+                if not p.exists():
+                    return json.dumps({
+                        "success": False,
+                        "error": "Image file not found",
+                        "details": f"Path: {img_path}"
+                    }, ensure_ascii=False, indent=2)
+
+                if not p.is_file():
+                    return json.dumps({
+                        "success": False,
+                        "error": "Path is not a file",
+                        "details": f"Path: {img_path}"
+                    }, ensure_ascii=False, indent=2)
+
+                size = p.stat().st_size
+                if size > 1_000_000:
+                    return json.dumps({
+                        "success": False,
+                        "error": "Image too large",
+                        "details": f"Path: {img_path} ({size:,} bytes, max 1,000,000)"
+                    }, ensure_ascii=False, indent=2)
+
+                try:
+                    images_data.append(p.read_bytes())
+                except Exception as read_err:
+                    return json.dumps({
+                        "success": False,
+                        "error": "Failed to read image file",
+                        "details": f"Path: {img_path}. Error: {str(read_err)}"
+                    }, ensure_ascii=False, indent=2)
+
+            alts = image_alts or []
+            if len(alts) < len(images_data):
+                alts = alts + [""] * (len(images_data) - len(alts))
+
+            uploads = [client.upload_blob(img) for img in images_data]
+            embed_images = [
+                models.AppBskyEmbedImages.Image(alt=alt, image=upload.blob)
+                for alt, upload in zip(alts, uploads)
+            ]
+            embed = models.AppBskyEmbedImages.Main(images=embed_images)
+
         text_builder = _build_rich_text(text, client)
 
         if link_url:
@@ -303,17 +366,17 @@ def send_post(
                 text_builder.text(" ")
             text_builder.link(link_display, link_url)
 
-        post = client.send_post(text_builder)
+        post = client.send_post(text_builder, embed=embed)
 
+        imgs_note = f" with {len(image_paths)} image(s)" if image_paths else ""
         return json.dumps({
             "success": True,
             "uri": post.uri,
             "cid": post.cid,
-            "message": f"Post sent successfully! ({total_len}/300 chars used)"
+            "message": f"Post{imgs_note} sent successfully! ({total_len}/300 chars used)"
         }, ensure_ascii=False, indent=2)
 
     except Exception as e:
-        # 如果 API 报错，大概率是长度问题，提供详细的长度分解帮助 AI 调试
         breakdown = {
             "text_body": f"{text_len} chars"
         }
@@ -324,6 +387,8 @@ def send_post(
             instruction = ("If the error mentions length/graphemes, shorten the text body or provide a shorter link_title. "
                            "Note: The link_title is the clickable display text. If no link_title is given, "
                            "the full URL is displayed and counts toward the 300 character limit.")
+        if image_paths:
+            instruction += " If it mentions blob size, compress the images to under 1MB each."
 
         breakdown["total_approx"] = f"{total_len} chars"
         breakdown["limit"] = 300
@@ -470,7 +535,7 @@ def get_author_feed(
     获取某个用户的帖子列表。
 
     Args:
-        handle: 用户 handle (例如: nocturne.bsky.social)
+        handle: 用户 handle (例如: misaligned-codex.bsky.social)
         limit: 获取帖子数量，最大 100
         cursor: 分页游标
 
@@ -740,7 +805,7 @@ def get_profile(handle: str) -> str:
     获取用户资料。
 
     Args:
-        handle: 用户 handle (例如: nocturne.bsky.social)
+        handle: 用户 handle (例如: misaligned-codex.bsky.social)
 
     Returns:
         用户资料信息
@@ -814,6 +879,107 @@ def unfollow_user(handle: str) -> str:
     }, ensure_ascii=False, indent=2)
 
 
+# ============================================================================
+# 屏蔽相关工具
+# ============================================================================
+
+@mcp.tool()
+def block_user(handle: str) -> str:
+    """
+    屏蔽一个用户。被屏蔽的用户无法点赞、回复、提及或关注你，
+    其帖子和资料也会从你的视野中隐藏。
+
+    Args:
+        handle: 用户 handle (例如: spambot.bsky.social)
+
+    Returns:
+        屏蔽结果
+    """
+    client = get_client()
+
+    try:
+        profile = client.get_profile(actor=handle)
+
+        viewer = getattr(profile, 'viewer', None)
+        if viewer:
+            blocking = getattr(viewer, 'blocking', None)
+            if blocking:
+                return json.dumps({
+                    "success": False,
+                    "error": f"Already blocking @{handle}",
+                    "existing_block_uri": blocking,
+                }, ensure_ascii=False, indent=2)
+
+        record = models.AppBskyGraphBlock.Record(
+            created_at=client.get_current_time_iso(),
+            subject=profile.did
+        )
+        result = client.app.bsky.graph.block.create(client.me.did, record)
+
+        return json.dumps({
+            "success": True,
+            "blocked": handle,
+            "did": profile.did,
+            "block_uri": result.uri,
+            "message": f"Blocked @{handle}. They can no longer interact with you."
+        }, ensure_ascii=False, indent=2)
+
+    except Exception as e:
+        return json.dumps({
+            "success": False,
+            "error": "Failed to block user",
+            "details": str(e),
+        }, ensure_ascii=False, indent=2)
+
+
+@mcp.tool()
+def unblock_user(handle: str) -> str:
+    """
+    取消屏蔽一个用户。
+
+    Args:
+        handle: 要取消屏蔽的用户 handle
+
+    Returns:
+        取消屏蔽结果
+    """
+    client = get_client()
+
+    try:
+        profile = client.get_profile(actor=handle)
+
+        viewer = getattr(profile, 'viewer', None)
+        block_uri = None
+        if viewer:
+            block_uri = getattr(viewer, 'blocking', None)
+
+        if not block_uri:
+            return json.dumps({
+                "success": False,
+                "error": f"Not currently blocking @{handle}",
+            }, ensure_ascii=False, indent=2)
+
+        rkey = block_uri.split("/")[-1]
+        client.app.bsky.graph.block.delete(client.me.did, rkey)
+
+        return json.dumps({
+            "success": True,
+            "unblocked": handle,
+            "message": f"Unblocked @{handle}."
+        }, ensure_ascii=False, indent=2)
+
+    except Exception as e:
+        return json.dumps({
+            "success": False,
+            "error": "Failed to unblock user",
+            "details": str(e),
+        }, ensure_ascii=False, indent=2)
+
+
+# ============================================================================
+# 搜索工具
+# ============================================================================
+
 @mcp.tool()
 def search(
     query: str,
@@ -825,7 +991,7 @@ def search(
     搜索帖子或用户。
 
     Args:
-        query: 搜索关键词(and 逻辑，输入的关键词越多，得到的结果越少)
+        query: 搜索关键词(关键词之间是** AND 逻辑**，输入的关键词越多，得到的结果越少)
         type: 搜索类型，"posts" 或 "users"，默认 "posts"
         limit: 返回数量，最大 100
         cursor: 分页游标
