@@ -159,6 +159,27 @@ def _get_attr(obj: Any, path: str, default: Any = None) -> Any:
     return current
 
 
+def _get_viewer_record_uri(client: Client, post_uri: str, kind: str) -> Optional[str]:
+    """
+    取得当前登录账号对某帖子所创建的互动记录的 AT URI。
+
+    删除类操作（unlike / unrepost）需要的是【互动记录本身】的 URI，
+    而不是被互动的帖子 URI。该 URI 只能从 post.viewer 里拿到。
+
+    Args:
+        post_uri: 帖子的 AT URI
+        kind: "like" 或 "repost"
+
+    Returns:
+        记录的 AT URI；若当前账号未做过该互动则返回 None
+    """
+    res = client.get_posts([post_uri])
+    posts = getattr(res, "posts", None) or []
+    if not posts:
+        return None
+    return _get_attr(posts[0], f"viewer.{kind}")
+
+
 def format_post(post_data: Any, include_reply_context: bool = False) -> dict:
     """格式化帖子数据，使其更易读"""
     # Handle both dict and object input
@@ -652,13 +673,29 @@ def unlike_post(post_uri: str) -> str:
     """
     client = get_client()
 
-    success = client.unlike(post_uri)
+    try:
+        # client.unlike() 需要 like 记录的 AT URI，而不是帖子本身的 URI。
+        like_uri = _get_viewer_record_uri(client, post_uri, "like")
 
-    return json.dumps({
-        "success": True,
-        "unliked_post": post_uri,
-        "message": "Unliked successfully!"
-    }, ensure_ascii=False, indent=2)
+        if not like_uri:
+            return json.dumps({
+                "success": False,
+                "error": "You have not liked this post.",
+            }, ensure_ascii=False, indent=2)
+
+        success = client.unlike(like_uri)
+
+        return json.dumps({
+            "success": bool(success),
+            "unliked_post": post_uri,
+            "message": "Unliked successfully!" if success else "Failed to unlike.",
+        }, ensure_ascii=False, indent=2)
+
+    except Exception as e:
+        return json.dumps({
+            "success": False,
+            "error": f"{type(e).__name__}: {e}",
+        }, ensure_ascii=False, indent=2)
 
 
 @mcp.tool()
@@ -702,13 +739,29 @@ def unrepost(post_uri: str) -> str:
     """
     client = get_client()
 
-    success = client.unrepost(post_uri)
+    try:
+        # client.unrepost() 需要 repost 记录的 AT URI，而不是帖子本身的 URI。
+        repost_uri = _get_viewer_record_uri(client, post_uri, "repost")
 
-    return json.dumps({
-        "success": True,
-        "unreposted_post": post_uri,
-        "message": "Unreposted successfully!"
-    }, ensure_ascii=False, indent=2)
+        if not repost_uri:
+            return json.dumps({
+                "success": False,
+                "error": "You have not reposted this post.",
+            }, ensure_ascii=False, indent=2)
+
+        success = client.unrepost(repost_uri)
+
+        return json.dumps({
+            "success": bool(success),
+            "unreposted_post": post_uri,
+            "message": "Unreposted successfully!" if success else "Failed to unrepost.",
+        }, ensure_ascii=False, indent=2)
+
+    except Exception as e:
+        return json.dumps({
+            "success": False,
+            "error": f"{type(e).__name__}: {e}",
+        }, ensure_ascii=False, indent=2)
 
 
 # ============================================================================
@@ -867,16 +920,33 @@ def unfollow_user(handle: str) -> str:
     """
     client = get_client()
 
-    # 先获取用户的 DID
-    profile = client.get_profile(actor=handle)
+    try:
+        profile = client.get_profile(actor=handle)
 
-    success = client.unfollow(profile.did)
+        # client.unfollow() 需要的是 follow 记录的 AT URI，不是用户的 DID。
+        # 该 URI 只存在于 viewer.following 中（未关注时为 None）。
+        viewer = getattr(profile, 'viewer', None)
+        follow_uri = getattr(viewer, 'following', None) if viewer else None
 
-    return json.dumps({
-        "success": True,
-        "unfollowed": handle,
-        "message": f"Unfollowed @{handle}!"
-    }, ensure_ascii=False, indent=2)
+        if not follow_uri:
+            return json.dumps({
+                "success": False,
+                "error": f"Not currently following @{handle}",
+            }, ensure_ascii=False, indent=2)
+
+        success = client.unfollow(follow_uri)
+
+        return json.dumps({
+            "success": bool(success),
+            "unfollowed": handle,
+            "message": f"Unfollowed @{handle}!" if success else f"Failed to unfollow @{handle}.",
+        }, ensure_ascii=False, indent=2)
+
+    except Exception as e:
+        return json.dumps({
+            "success": False,
+            "error": f"{type(e).__name__}: {e}",
+        }, ensure_ascii=False, indent=2)
 
 
 # ============================================================================
