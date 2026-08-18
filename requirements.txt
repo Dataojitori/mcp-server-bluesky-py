@@ -1,4 +1,6 @@
 mcp
-atproto
+# >=0.0.68: adds AppBskyEmbedGallery. Older SDKs raise a pydantic
+# union_tag_invalid on any feed containing app.bsky.embed.gallery#view.
+atproto>=0.0.68
 pydantic
 python-dotenv
